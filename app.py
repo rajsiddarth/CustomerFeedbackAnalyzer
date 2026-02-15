@@ -1,6 +1,9 @@
 # app.py
 # GenAI Sentiment Analysis Dashboard (continuous -1.0 to +1.0 scoring)
-# + graph descriptions + lighter red for Negative
+# - Users can upload their own CSV, otherwise app uses local sample dataset
+# - Graph descriptions included
+# - Negative shown as light red
+# - FIXED: session_state resets + DataFrame.update() not adding new columns (charts now render)
 
 import os
 import re
@@ -11,26 +14,61 @@ import plotly.express as px
 import openai
 from dotenv import load_dotenv
 
-# Load environment variables (.env should include OPENAI_API_KEY=...)
-load_dotenv()
+# -----------------------------
+# OpenAI key + client (robust locally + Streamlit Cloud)
+# -----------------------------
+api_key = None
 
-# Initialize OpenAI client
-client = openai.OpenAI()
+# Try Streamlit secrets first (won't crash if secrets missing / misconfigured)
+try:
+    api_key = st.secrets.get("OPENAI_API_KEY", None)
+except Exception:
+    api_key = None
 
+# Fall back to .env for local dev
+if not api_key:
+    load_dotenv()
+    api_key = os.getenv("OPENAI_API_KEY")
+
+if not api_key:
+    st.error(
+        "OpenAI API key not found.\n\n"
+        "Local dev:\n"
+        "  • Create a `.env` file with `OPENAI_API_KEY=...`\n"
+        "  • OR create `.streamlit/secrets.toml` with `OPENAI_API_KEY = \"...\"`\n\n"
+        "Streamlit Cloud:\n"
+        "  • Set `OPENAI_API_KEY` in App Settings → Secrets."
+    )
+    st.stop()
+
+client = openai.OpenAI(api_key=api_key)
 
 # -----------------------------
 # Helpers
 # -----------------------------
 def get_dataset_path() -> str:
     """
-    Assumes:
-      /your_repo/
-        app.py
-        /data/customer_reviews.csv
+    Assumes your repo contains:
+      /data/customer_reviews.csv
+      /app.py
     """
     current_dir = os.path.dirname(os.path.abspath(__file__))
     csv_path = os.path.join(current_dir, "data", "customer_reviews.csv")
     return os.path.normpath(csv_path)
+
+
+def load_local_dataset() -> pd.DataFrame | None:
+    try:
+        return pd.read_csv(get_dataset_path())
+    except Exception as e:
+        st.error(f"Could not load local sample dataset: {e}")
+        return None
+
+
+def validate_schema(df: pd.DataFrame) -> None:
+    if "SUMMARY" not in df.columns:
+        st.error("Dataset must contain a `SUMMARY` column.")
+        st.stop()
 
 
 @st.cache_data
@@ -59,35 +97,22 @@ def get_sentiment_score(text: str) -> float:
         )
 
         raw = resp.output[0].content[0].text.strip()
-
-        # Extract first float-like token defensively
         m = re.search(r"-?\d+(\.\d+)?", raw)
         if not m:
             return 0.0
 
         score = float(m.group(0))
-
-        # Clamp to [-1.0, 1.0]
         score = max(-1.0, min(1.0, score))
 
-        # Guard against NaN/inf
         if not math.isfinite(score):
             return 0.0
 
         return score
-
     except Exception:
         return 0.0
 
 
 def score_to_label(score: float, pos_threshold: float = 0.2, neg_threshold: float = -0.2) -> str:
-    """
-    Converts a continuous score into a label for counting/distribution.
-    Defaults:
-      score >  0.2 => Positive
-      score < -0.2 => Negative
-      else         => Neutral
-    """
     if score > pos_threshold:
         return "Positive"
     if score < neg_threshold:
@@ -101,57 +126,74 @@ def score_to_label(score: float, pos_threshold: float = 0.2, neg_threshold: floa
 st.set_page_config(page_title="GenAI Sentiment Dashboard", layout="wide")
 
 st.title("🔍 GenAI Sentiment Analysis Dashboard")
-st.write("This app scores each review’s sentiment on a continuous scale from **-1.0 to +1.0** using OpenAI.")
+st.write(
+    "This app scores each review’s sentiment on a continuous scale from **-1.0 to +1.0** using OpenAI.\n\n"
+    "**If you don’t have your own dataset, the app will use a built-in sample dataset automatically.**"
+)
 
-# Custom colors (you asked: Negative = light red)
 COLOR_MAP = {
     "Negative": "#ffb3b3",  # light red
-    "Neutral": "#d9d9d9",  # light gray
+    "Neutral": "#d9d9d9",   # light gray
     "Positive": "#2e7d32",  # green
 }
 
-col1, col2, col3 = st.columns([1, 1, 2])
+# -----------------------------
+# Data source: upload or local sample
+# -----------------------------
+st.subheader("📤 Upload Your Review Dataset (CSV)")
+uploaded_file = st.file_uploader(
+    "Upload a CSV file (required: SUMMARY; recommended: PRODUCT)",
+    type=["csv"],
+    help="If you do not upload a file, the app will use the built-in sample dataset."
+)
 
-with col1:
-    if st.button("📥 Load Dataset"):
-        try:
-            csv_path = get_dataset_path()
-            df = pd.read_csv(csv_path)
+# Load data (upload preferred, otherwise local sample)
+if uploaded_file is not None:
+    try:
+        df_loaded = pd.read_csv(uploaded_file)
+        data_source_label = "Uploaded dataset"
+    except Exception as e:
+        st.error(f"Could not read uploaded CSV: {e}")
+        st.stop()
+else:
+    df_loaded = load_local_dataset()
+    data_source_label = "Built-in sample dataset"
+    if df_loaded is None:
+        st.stop()
 
-            # Limit rows initially to control API cost
-            st.session_state["df"] = df.head(10).copy()
+validate_schema(df_loaded)
 
-            st.success(f"Dataset loaded successfully! Showing first {len(st.session_state['df'])} rows.")
-            st.caption(f"Loaded from: {csv_path}")
+st.caption(
+    f"✅ Data source: **{data_source_label}** | Rows: **{len(df_loaded):,}** | Columns: **{len(df_loaded.columns)}**"
+)
 
-        except FileNotFoundError:
-            st.error("Dataset not found. Please check the file path in get_dataset_path().")
+# IMPORTANT: only initialize df once (or reset only when a new upload happens)
+if "df" not in st.session_state:
+    st.session_state["df"] = df_loaded.copy()
 
-        except Exception as e:
-            st.error(f"Failed to load dataset: {e}")
+if uploaded_file is not None:
+    # user changed dataset → reset session df
+    st.session_state["df"] = df_loaded.copy()
 
-with col2:
-    if st.button("🔍 Analyze Sentiment (−1 to +1)"):
-        if "df" not in st.session_state:
-            st.warning("Please load the dataset first.")
-        else:
-            df = st.session_state["df"].copy()
+# -----------------------------
+# Controls
+# -----------------------------
+st.subheader("⚙️ Controls")
+colA, colB, colC = st.columns([1, 1, 2])
 
-            if "SUMMARY" not in df.columns:
-                st.error("Your dataset must contain a 'SUMMARY' column.")
-            else:
-                try:
-                    with st.spinner("Analyzing sentiment with OpenAI..."):
-                        df["SentimentScore"] = df["SUMMARY"].apply(get_sentiment_score)
-                        df["SentimentLabel"] = df["SentimentScore"].apply(score_to_label)
-                        st.session_state["df"] = df
+with colA:
+    max_to_score = st.number_input(
+        "Max reviews to score (controls cost)",
+        min_value=1,
+        max_value=int(len(st.session_state["df"])),
+        value=min(30, int(len(st.session_state["df"]))),
+        step=1
+    )
 
-                    st.success("Sentiment scoring completed!")
+# We'll compute filter BEFORE scoring so user can optionally score current selection
+df_current = st.session_state["df"]
 
-                except Exception as e:
-                    st.error(f"Something went wrong: {e}")
-
-with col3:
+with colC:
     st.markdown(
         """
         **How scoring works**
@@ -159,7 +201,7 @@ with col3:
         - **0.0** = neutral / mixed sentiment  
         - **+1.0** = very positive sentiment  
 
-        **How labels are assigned (for the “counts” chart)**
+        **How labels are assigned**
         - score < **-0.2** → Negative  
         - -0.2 to 0.2 → Neutral  
         - score > **0.2** → Positive  
@@ -167,113 +209,147 @@ with col3:
     )
 
 # -----------------------------
-# Main display
+# Filter by product
 # -----------------------------
-if "df" in st.session_state:
-    df = st.session_state["df"]
+st.subheader("🔍 Filter by Product")
 
-    st.subheader("🔍 Filter by Product")
-
-    if "PRODUCT" in df.columns:
-        products = sorted(df["PRODUCT"].dropna().unique().tolist())
-        product = st.selectbox("Choose a product", ["All Products"] + products)
-
-        if product != "All Products":
-            filtered_df = df[df["PRODUCT"] == product].copy()
-        else:
-            filtered_df = df.copy()
-
-        st.subheader(f"📁 Reviews for {product}")
+if "PRODUCT" in df_current.columns:
+    products = sorted(df_current["PRODUCT"].dropna().unique().tolist())
+    product = st.selectbox("Choose a product", ["All Products"] + products)
+    if product != "All Products":
+        filtered_df = df_current[df_current["PRODUCT"] == product].copy()
     else:
-        product = "All Products"
-        filtered_df = df.copy()
-        st.info("No PRODUCT column found — showing all rows without product filtering.")
+        filtered_df = df_current.copy()
+    st.subheader(f"📁 Reviews for {product}")
+else:
+    product = "All Products"
+    filtered_df = df_current.copy()
+    st.info("No PRODUCT column found — showing all rows without product filtering.")
 
-    st.dataframe(filtered_df, use_container_width=True)
+# -----------------------------
+# Analyze button (FIXED: assigns via .loc so new columns are created)
+# -----------------------------
+with colB:
+    if st.button("🔍 Analyze Sentiment (−1 to +1)"):
+        df = st.session_state["df"].copy()
 
-    if "SentimentScore" in df.columns and "SentimentLabel" in df.columns:
-        st.divider()
+        # Score only the currently filtered rows (up to max_to_score)
+        target = filtered_df.head(int(max_to_score)).copy()
 
-        # --- Chart 1: Label distribution (counts) ---
-        st.subheader(f"📊 Chart 1: Sentiment Label Distribution — {product}")
-        st.caption(
-            "What this shows: the **number of reviews** classified as **Negative / Neutral / Positive** "
-            "based on the sentiment score thresholds. This helps you see whether the overall feedback mix "
-            "is skewed negative or positive."
-        )
+        if "SUMMARY" not in target.columns:
+            st.error("Dataset must contain a 'SUMMARY' column.")
+            st.stop()
 
-        sentiment_counts = (
-            filtered_df["SentimentLabel"]
-            .value_counts()
-            .rename_axis("SentimentLabel")
-            .reset_index(name="Count")
-        )
+        try:
+            with st.spinner(f"Scoring sentiment for {len(target):,} reviews..."):
+                scores = target["SUMMARY"].apply(get_sentiment_score)
+                labels = scores.apply(score_to_label)
 
-        order = ["Negative", "Neutral", "Positive"]
-        sentiment_counts["SentimentLabel"] = pd.Categorical(
-            sentiment_counts["SentimentLabel"], categories=order, ordered=True
-        )
-        sentiment_counts = sentiment_counts.sort_values("SentimentLabel")
+                # Write back into the main df using index alignment (CREATES new columns)
+                df.loc[target.index, "SentimentScore"] = scores
+                df.loc[target.index, "SentimentLabel"] = labels
 
-        fig = px.bar(
-            sentiment_counts,
-            x="SentimentLabel",
-            y="Count",
-            title=f"Distribution of Sentiment Labels - {product}",
-            labels={"SentimentLabel": "Sentiment Category", "Count": "Number of Reviews"},
-            color="SentimentLabel",
-            color_discrete_map=COLOR_MAP,  # <-- your custom colors
-            category_orders={"SentimentLabel": order},
-        )
-        fig.update_layout(showlegend=False, xaxis_title="Sentiment Category", yaxis_title="Number of Reviews")
-        st.plotly_chart(fig, use_container_width=True)
+                st.session_state["df"] = df
 
-        # --- Chart 2: Score histogram ---
-        st.subheader(f"📈 Chart 2: Sentiment Score Histogram — {product}")
-        st.caption(
-            "What this shows: how sentiment scores are distributed from **-1.0 to +1.0**. "
-            "If most bars cluster near **+1**, reviews are strongly positive; near **-1**, strongly negative; "
-            "near **0**, mixed/neutral sentiment."
-        )
+            st.success("Sentiment scoring completed!")
+        except Exception as e:
+            st.error(f"Something went wrong: {e}")
 
-        fig_hist = px.histogram(
-            filtered_df,
-            x="SentimentScore",
-            nbins=20,
-            title=f"Sentiment Score Distribution (−1 to +1) - {product}",
-            labels={"SentimentScore": "Sentiment Score (−1 to +1)"},
-        )
-        fig_hist.update_layout(xaxis_title="Sentiment Score (−1 to +1)", yaxis_title="Number of Reviews")
-        st.plotly_chart(fig_hist, use_container_width=True)
-
-        st.divider()
-
-        # --- Chart 3: Average score by product ---
-        if "PRODUCT" in df.columns:
-            st.subheader("📌 Chart 3: Average Sentiment Score by Product")
-            st.caption(
-                "What this shows: the **average sentiment score** per product. "
-                "This is useful for comparing products at a glance. "
-                "Closer to **+1** = more positive average sentiment; closer to **-1** = more negative."
-            )
-
-            avg_scores = (
-                df.groupby("PRODUCT")["SentimentScore"]
-                .mean()
-                .reset_index()
-                .sort_values("SentimentScore")
-            )
-
-            fig_avg = px.bar(
-                avg_scores,
-                x="PRODUCT",
-                y="SentimentScore",
-                title="Average Sentiment Score by Product (−1 to +1)",
-                labels={"PRODUCT": "Product", "SentimentScore": "Avg Sentiment Score"},
-            )
-            fig_avg.update_layout(xaxis_tickangle=-30, xaxis_title="Product",
-                                  yaxis_title="Avg Sentiment Score (−1 to +1)")
-            st.plotly_chart(fig_avg, use_container_width=True)
-
+# Refresh current/filtered after potential scoring
+df_current = st.session_state["df"]
+if "PRODUCT" in df_current.columns:
+    if product != "All Products":
+        filtered_df = df_current[df_current["PRODUCT"] == product].copy()
     else:
-        st.info("Click **Analyze Sentiment (−1 to +1)** to generate SentimentScore and SentimentLabel.")
+        filtered_df = df_current.copy()
+else:
+    filtered_df = df_current.copy()
+
+st.dataframe(filtered_df, use_container_width=True)
+
+# -----------------------------
+# Charts
+# -----------------------------
+if "SentimentScore" in df_current.columns and "SentimentLabel" in df_current.columns:
+    scored = filtered_df.dropna(subset=["SentimentScore", "SentimentLabel"]).copy()
+
+    if len(scored) == 0:
+        st.info("No rows in the current view have been scored yet. Click **Analyze Sentiment**.")
+        st.stop()
+
+    st.divider()
+
+    # Chart 1: Breakdown (Neg/Neutral/Pos)
+    st.subheader(f"📊 Chart 1: Review Sentiment Breakdown — {product}")
+    st.caption(
+        "What this shows: the total number of reviews classified as **Negative, Neutral, and Positive** "
+        "based on sentiment score thresholds."
+    )
+
+    sentiment_counts = (
+        scored["SentimentLabel"]
+        .value_counts()
+        .reindex(["Negative", "Neutral", "Positive"], fill_value=0)
+        .reset_index()
+    )
+    sentiment_counts.columns = ["SentimentLabel", "Count"]
+
+    fig1 = px.bar(
+        sentiment_counts,
+        x="SentimentLabel",
+        y="Count",
+        title=f"Review Sentiment Breakdown - {product}",
+        labels={"SentimentLabel": "Sentiment Category", "Count": "Number of Reviews"},
+        color="SentimentLabel",
+        color_discrete_map=COLOR_MAP,
+        category_orders={"SentimentLabel": ["Negative", "Neutral", "Positive"]},
+    )
+    fig1.update_layout(showlegend=False, xaxis_title="Sentiment Category", yaxis_title="Number of Reviews")
+    st.plotly_chart(fig1, use_container_width=True)
+
+    # Chart 2: Histogram
+    st.subheader(f"📈 Chart 2: Sentiment Score Histogram — {product}")
+    st.caption(
+        "What this shows: how sentiment scores are distributed from **-1.0 to +1.0**. "
+        "Clusters near **+1** indicate strongly positive feedback; near **-1** strongly negative; near **0** mixed/neutral."
+    )
+
+    fig2 = px.histogram(
+        scored,
+        x="SentimentScore",
+        nbins=20,
+        title=f"Sentiment Score Distribution (−1 to +1) - {product}",
+        labels={"SentimentScore": "Sentiment Score (−1 to +1)"},
+    )
+    fig2.update_layout(xaxis_title="Sentiment Score (−1 to +1)", yaxis_title="Number of Reviews")
+    st.plotly_chart(fig2, use_container_width=True)
+
+    # Chart 3: Average by product
+    if "PRODUCT" in df_current.columns:
+        st.divider()
+        st.subheader("📌 Chart 3: Average Sentiment Score by Product")
+        st.caption(
+            "What this shows: the **average sentiment score** per product (using only scored rows). "
+            "Closer to **+1** = more positive average sentiment; closer to **-1** = more negative."
+        )
+
+        scored_all = df_current.dropna(subset=["SentimentScore"]).copy()
+        avg_scores = (
+            scored_all.groupby("PRODUCT")["SentimentScore"]
+            .mean()
+            .reset_index()
+            .sort_values("SentimentScore")
+        )
+
+        fig3 = px.bar(
+            avg_scores,
+            x="PRODUCT",
+            y="SentimentScore",
+            title="Average Sentiment Score by Product (−1 to +1)",
+            labels={"PRODUCT": "Product", "SentimentScore": "Avg Sentiment Score"},
+        )
+        fig3.update_layout(xaxis_tickangle=-30, xaxis_title="Product", yaxis_title="Avg Sentiment Score (−1 to +1)")
+        st.plotly_chart(fig3, use_container_width=True)
+else:
+    st.info("Click **Analyze Sentiment (−1 to +1)** to generate SentimentScore and SentimentLabel.")
+
