@@ -4,6 +4,7 @@
 # - Graph descriptions included
 # - Negative shown as light red
 # - FIXED: session_state resets + DataFrame.update() not adding new columns (charts now render)
+# - ADDED: multi-product filter, table shows limited rows, robust label generation, fixed chart titles
 
 import os
 import re
@@ -190,9 +191,6 @@ with colA:
         step=1
     )
 
-# We'll compute filter BEFORE scoring so user can optionally score current selection
-df_current = st.session_state["df"]
-
 with colC:
     st.markdown(
         """
@@ -209,63 +207,103 @@ with colC:
     )
 
 # -----------------------------
-# Filter by product
+# Filter by product (MULTISELECT)
 # -----------------------------
-st.subheader("🔍 Filter by Product")
+df_current = st.session_state["df"]
 
+st.subheader("🔍 Filter by Product")
 if "PRODUCT" in df_current.columns:
     products = sorted(df_current["PRODUCT"].dropna().unique().tolist())
-    product = st.selectbox("Choose a product", ["All Products"] + products)
-    if product != "All Products":
-        filtered_df = df_current[df_current["PRODUCT"] == product].copy()
+
+    selected_products = st.multiselect(
+        "Choose one or more products",
+        options=products,
+        default=[],
+        help="Select multiple products to filter. Leave empty to show all products."
+    )
+
+    if selected_products:
+        filtered_df = df_current[df_current["PRODUCT"].isin(selected_products)].copy()
+        label = ", ".join(selected_products)
     else:
         filtered_df = df_current.copy()
-    st.subheader(f"📁 Reviews for {product}")
+        label = "All Products"
+
+    st.subheader(f"📁 Reviews for: {label}")
 else:
-    product = "All Products"
+    selected_products = []
     filtered_df = df_current.copy()
+    label = "All Products"
     st.info("No PRODUCT column found — showing all rows without product filtering.")
 
 # -----------------------------
-# Analyze button (FIXED: assigns via .loc so new columns are created)
+# Analyze Button (Full Width)
 # -----------------------------
-with colB:
-    if st.button("🔍 Analyze Sentiment (−1 to +1)"):
-        df = st.session_state["df"].copy()
+st.divider()
+if st.button("🔍 Analyze Sentiment (−1 to +1)"):
+    df = st.session_state["df"].copy()
+    target = filtered_df.head(int(max_to_score)).copy()
 
-        # Score only the currently filtered rows (up to max_to_score)
-        target = filtered_df.head(int(max_to_score)).copy()
+    if "SUMMARY" not in target.columns:
+        st.error("Dataset must contain a 'SUMMARY' column.")
+        st.stop()
 
-        if "SUMMARY" not in target.columns:
-            st.error("Dataset must contain a 'SUMMARY' column.")
-            st.stop()
+    try:
+        with st.spinner(f"Scoring sentiment for {len(target):,} reviews..."):
+            scores = target["SUMMARY"].apply(get_sentiment_score)
+            labels_series = scores.apply(score_to_label)
 
-        try:
-            with st.spinner(f"Scoring sentiment for {len(target):,} reviews..."):
-                scores = target["SUMMARY"].apply(get_sentiment_score)
-                labels = scores.apply(score_to_label)
+            df.loc[target.index, "SentimentScore"] = scores
+            df.loc[target.index, "SentimentLabel"] = labels_series
 
-                # Write back into the main df using index alignment (CREATES new columns)
-                df.loc[target.index, "SentimentScore"] = scores
-                df.loc[target.index, "SentimentLabel"] = labels
+            st.session_state["df"] = df
 
-                st.session_state["df"] = df
+        st.success("Sentiment scoring completed!")
+    except Exception as e:
+        st.error(f"Something went wrong: {e}")
 
-            st.success("Sentiment scoring completed!")
-        except Exception as e:
-            st.error(f"Something went wrong: {e}")
-
-# Refresh current/filtered after potential scoring
+# -----------------------------
+# Refresh state after potential scoring
+# -----------------------------
 df_current = st.session_state["df"]
+
 if "PRODUCT" in df_current.columns:
-    if product != "All Products":
-        filtered_df = df_current[df_current["PRODUCT"] == product].copy()
+    if selected_products:
+        filtered_df = df_current[df_current["PRODUCT"].isin(selected_products)].copy()
+        label = ", ".join(selected_products)
     else:
         filtered_df = df_current.copy()
+        label = "All Products"
 else:
     filtered_df = df_current.copy()
+    label = "All Products"
 
-st.dataframe(filtered_df, use_container_width=True)
+# If SentimentScore exists but SentimentLabel doesn't, generate it (enables charts on pre-scored datasets)
+if "SentimentScore" in df_current.columns and "SentimentLabel" not in df_current.columns:
+    df_current["SentimentLabel"] = df_current["SentimentScore"].apply(score_to_label)
+    st.session_state["df"] = df_current
+    # refresh filtered_df too
+    if "PRODUCT" in df_current.columns:
+        if selected_products:
+            filtered_df = df_current[df_current["PRODUCT"].isin(selected_products)].copy()
+        else:
+            filtered_df = df_current.copy()
+    else:
+        filtered_df = df_current.copy()
+
+# -----------------------------
+# Table display (only selected columns) + respect max_to_score
+# -----------------------------
+DISPLAY_COLS = ["DATE", "PRODUCT", "SUMMARY"]  # adjust DATE name if yours differs
+available_cols = [c for c in DISPLAY_COLS if c in filtered_df.columns]
+missing_cols = [c for c in DISPLAY_COLS if c not in filtered_df.columns]
+
+if missing_cols:
+    st.info(f"Missing column(s) in this dataset: {', '.join(missing_cols)}")
+
+table_df = filtered_df.head(int(max_to_score)).copy()
+st.caption(f"Showing **{len(table_df):,}** of **{len(filtered_df):,}** filtered rows.")
+st.dataframe(table_df[available_cols], use_container_width=True)
 
 # -----------------------------
 # Charts
@@ -280,9 +318,9 @@ if "SentimentScore" in df_current.columns and "SentimentLabel" in df_current.col
     st.divider()
 
     # Chart 1: Breakdown (Neg/Neutral/Pos)
-    st.subheader(f"📊 Chart 1: Review Sentiment Breakdown — {product}")
+    st.subheader(f"📊 Chart 1: Review Sentiment Breakdown — {label}")
     st.caption(
-        "What this shows: the total number of reviews classified as **Negative, Neutral, and Positive** "
+        "What this shows: The number of reviews among the currently filtered & scored rows classified as **Negative, Neutral, and Positive** "
         "based on sentiment score thresholds."
     )
 
@@ -298,7 +336,7 @@ if "SentimentScore" in df_current.columns and "SentimentLabel" in df_current.col
         sentiment_counts,
         x="SentimentLabel",
         y="Count",
-        title=f"Review Sentiment Breakdown - {product}",
+        title=f"Review Sentiment Breakdown - {label}",
         labels={"SentimentLabel": "Sentiment Category", "Count": "Number of Reviews"},
         color="SentimentLabel",
         color_discrete_map=COLOR_MAP,
@@ -308,7 +346,7 @@ if "SentimentScore" in df_current.columns and "SentimentLabel" in df_current.col
     st.plotly_chart(fig1, use_container_width=True)
 
     # Chart 2: Histogram
-    st.subheader(f"📈 Chart 2: Sentiment Score Histogram — {product}")
+    st.subheader(f"📈 Chart 2: Sentiment Score Histogram — {label}")
     st.caption(
         "What this shows: how sentiment scores are distributed from **-1.0 to +1.0**. "
         "Clusters near **+1** indicate strongly positive feedback; near **-1** strongly negative; near **0** mixed/neutral."
@@ -318,7 +356,7 @@ if "SentimentScore" in df_current.columns and "SentimentLabel" in df_current.col
         scored,
         x="SentimentScore",
         nbins=20,
-        title=f"Sentiment Score Distribution (−1 to +1) - {product}",
+        title=f"Sentiment Score Distribution (−1 to +1) - {label}",
         labels={"SentimentScore": "Sentiment Score (−1 to +1)"},
     )
     fig2.update_layout(xaxis_title="Sentiment Score (−1 to +1)", yaxis_title="Number of Reviews")
@@ -352,4 +390,3 @@ if "SentimentScore" in df_current.columns and "SentimentLabel" in df_current.col
         st.plotly_chart(fig3, use_container_width=True)
 else:
     st.info("Click **Analyze Sentiment (−1 to +1)** to generate SentimentScore and SentimentLabel.")
-
